@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+websockets
+ollama
+requests
+PyQt6
+python-multipart
+aiofiles
+httpx
