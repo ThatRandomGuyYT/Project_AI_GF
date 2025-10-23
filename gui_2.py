@@ -3,6 +3,7 @@ import asyncio
 import websockets
 import requests
 import json
+import html
 from datetime import datetime
 from typing import Optional
 import ssl
@@ -21,6 +22,18 @@ from PyQt6.QtGui import (
     QFont, QColor, QPalette
 )
 
+from PyQt6.QtCore import QSettings
+
+def get_stored_session_id() -> Optional[str]:
+    """Retrieves the session ID from local settings."""
+    settings = QSettings("MyAICompany", "NeuroSamaGUI")
+    return settings.value("session_id", None)
+
+def store_session_id(session_id: str):
+    """Stores the session ID in local settings."""
+    settings = QSettings("MyAICompany", "NeuroSamaGUI")
+    settings.setValue("session_id", session_id)
+
 # Configuration
 WS_URL = "ws://127.0.0.1:7860/ws"
 HEALTH_URL = "http://127.0.0.1:7860/health"
@@ -31,9 +44,12 @@ class ConnectionWorker(QThread):
     message_received = pyqtSignal(str, bool)
     connection_changed = pyqtSignal(bool, str)
     location_changed = pyqtSignal(str)
+    tts_sync_received = pyqtSignal(str)
 
     def __init__(self, url: str):
         super().__init__()
+        session_id = get_stored_session_id()
+        self.url = f"{url}?session_id={session_id}" if session_id else url
         self.url = url
         self.should_reconnect = True
         self.max_retries = 10
@@ -93,7 +109,6 @@ class ConnectionWorker(QThread):
                     ping_timeout=30,
                     ping_interval=20,
                     close_timeout=10,
-                    extra_headers=extra_headers,
                     # Disable SSL verification for local connections
                     ssl=None if self.url.startswith("ws://") else ssl.create_default_context()
                 ) as websocket:
@@ -162,25 +177,87 @@ class ConnectionWorker(QThread):
             self.connection_changed.emit(False, "Max retries exceeded. Check server status.")
 
     async def _receive_messages(self, websocket):
-        """Handle incoming WebSocket messages"""
+        """Handle incoming WebSocket messages, stripping any [MEMORY_UPDATE] blocks."""
         try:
-            async for message in websocket:
-                if isinstance(message, bytes):
-                    # Skip binary messages for now
+            # We may receive memory blocks split across chunks, so keep a small buffer.
+            memory_mode = False
+            memory_buf = []
+
+            async for raw_message in websocket:
+                # Keep original handling for special server-sent markers
+                if raw_message.startswith("[SESSION_ID]"):
+                    session_id = raw_message[len("[SESSION_ID]"):]
+                    store_session_id(session_id)
+                    # update URL for future reconnects
+                    self.url = f"{WS_URL}?session_id={session_id}"
                     continue
 
-                # Handle special messages
-                if message.startswith("__LOCATION__"):
-                    location = message[len("__LOCATION__"):]
+                if raw_message.startswith("__TTS_SPEAKING__"):
+                    sentence = raw_message[len("__TTS_SPEAKING__"):]
+                    self.tts_sync_received.emit(sentence)
+                    continue
+
+                if raw_message.startswith("__LOCATION__"):
+                    location = raw_message[len("__LOCATION__"):]
                     self.location_changed.emit(location)
                     continue
 
-                # Handle end-of-message marker
-                if message == "__END__":
-                    self.message_received.emit("", True)  # Signal message complete
+                # If we are inside a memory capture mode (previous chunk started it)
+                if memory_mode:
+                    memory_buf.append(raw_message)
+                    # Check for close tag in this chunk
+                    if "[/MEMORY_UPDATE]" in raw_message:
+                        # End memory mode; process any trailing text after closing tag
+                        full_mem = "".join(memory_buf)
+                        closing_index = full_mem.find("[/MEMORY_UPDATE]") + len("[/MEMORY_UPDATE]")
+                        trailing = full_mem[closing_index:]
+                        memory_mode = False
+                        memory_buf = []
+                        if trailing:
+                            # If trailing equals the end marker or __END__, handle normally
+                            if trailing == "__END__":
+                                self.message_received.emit("", True)
+                            else:
+                                self.message_received.emit(trailing, False)
+                        # else nothing to emit
+                    # otherwise keep collecting memory block; do not emit anything
+                    continue
+
+                # Not currently in memory mode: check if this chunk starts a memory block
+                if "[MEMORY_UPDATE]" in raw_message:
+                    start_idx = raw_message.find("[MEMORY_UPDATE]")
+                    before = raw_message[:start_idx]
+                    after = raw_message[start_idx:]
+
+                    # Emit anything before the memory block
+                    if before:
+                        self.message_received.emit(before, False)
+
+                    # If the same chunk contains the end tag, handle trailing text too
+                    if "[/MEMORY_UPDATE]" in after:
+                        end_idx = after.find("[/MEMORY_UPDATE]") + len("[/MEMORY_UPDATE]")
+                        trailing = after[end_idx:]
+                        # If trailing contains __END__ exactly, treat as completion
+                        if trailing == "__END__":
+                            self.message_received.emit("", True)
+                        elif trailing:
+                            self.message_received.emit(trailing, False)
+                        # memory block present but fully handled; do not emit the memory content
+                        continue
+                    else:
+                        # Memory block spans future chunks — start memory_mode and buffer this part
+                        memory_mode = True
+                        memory_buf = [after]
+                        # do not emit the memory content itself
+                        continue
+
+                # Normal path: handle __END__ and normal streaming content
+                if raw_message == "__END__":
+                    self.message_received.emit("", True)  # complete
                 else:
-                    self.message_received.emit(message, False)  # Streaming content
-                    
+                    # Emit the streamed content chunk
+                    self.message_received.emit(raw_message, False)
+
         except websockets.exceptions.ConnectionClosedOK:
             self.connection_changed.emit(False, "Connection closed normally")
         except websockets.exceptions.ConnectionClosedError as e:
@@ -267,8 +344,7 @@ class ModernButton(QPushButton):
             self.setStyleSheet(
                 """
                 QPushButton {
-                    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, 
-                        stop:0 #667eea, stop:1 #764ba2);
+                    background: #6366f1;
                     color: white;
                     border: none;
                     border-radius: 22px;
@@ -277,12 +353,10 @@ class ModernButton(QPushButton):
                     padding: 0 20px;
                 }
                 QPushButton:hover {
-                    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, 
-                        stop:0 #7c8df0, stop:1 #8a5fb8);
+                    background: #5855eb;
                 }
                 QPushButton:pressed {
-                    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, 
-                        stop:0 #5a6fd8, stop:1 #6a4190);
+                    background: #4f4bdc;
                 }
                 QPushButton:disabled {
                     background: #4a4a4a;
@@ -294,21 +368,20 @@ class ModernButton(QPushButton):
             self.setStyleSheet(
                 """
                 QPushButton {
-                    background: rgba(255, 255, 255, 0.03);
-                    color: #e0e0e0;
-                    border: 1px solid rgba(255, 255, 255, 0.06);
+                    background: rgba(255, 255, 255, 0.2);
+                    color: white;
+                    border: 1px solid rgba(255, 255, 255, 0.3);
                     border-radius: 22px;
                     font-size: 14px;
                     font-weight: 500;
                     padding: 0 16px;
                 }
                 QPushButton:hover {
-                    background: rgba(255, 255, 255, 0.06);
-                    border-color: rgba(255, 255, 255, 0.12);
-                    color: white;
+                    background: rgba(255, 255, 255, 0.3);
+                    border-color: rgba(255, 255, 255, 0.4);
                 }
                 QPushButton:pressed {
-                    background: rgba(255, 255, 255, 0.04);
+                    background: rgba(255, 255, 255, 0.25);
                 }
                 """
             )
@@ -345,10 +418,12 @@ class MessageBubble(QFrame):
         # Message label
         self.message_label = QLabel(self.message)
         self.message_label.setWordWrap(True)
+        self.message_label.setTextFormat(Qt.TextFormat.RichText)
         font = QFont()
         font.setPointSize(13)
         self.message_label.setFont(font)
-        self.message_label.setStyleSheet("color: white; background: transparent;")
+        # Text color styled per bubble type in _get_bubble_style
+        self.message_label.setStyleSheet("background: transparent;")
         self.container_layout.addWidget(self.message_label)
 
         # Timestamp
@@ -356,7 +431,11 @@ class MessageBubble(QFrame):
         tfont = QFont()
         tfont.setPointSize(9)
         self.time_label.setFont(tfont)
-        self.time_label.setStyleSheet("color: rgba(255,255,255,0.55); background: transparent;")
+        # Timestamp color adjusted to match theme
+        self.time_label.setStyleSheet(
+            ("color: rgba(255,255,255,0.6); background: transparent;" if is_user 
+             else "color: rgba(44,62,80,0.65); background: transparent;")
+        )
         self.time_label.setAlignment(Qt.AlignmentFlag.AlignRight if is_user else Qt.AlignmentFlag.AlignLeft)
         self.container_layout.addWidget(self.time_label)
 
@@ -372,19 +451,49 @@ class MessageBubble(QFrame):
 
     def _get_bubble_style(self) -> str:
         if self.is_user:
+            # Match web: dark translucent with left border accent
+            self.message_label.setStyleSheet("color: white; background: transparent;")
             return (
-                "QFrame { background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #667eea, stop:1 #764ba2);"
-                "border-radius: 14px; }")
+                "QFrame { background: rgba(0,0,0,0.7);"
+                "border-left: 3px solid #667eea; border-radius: 16px; }"
+            )
         else:
+            # Match web: light bubble with dark text and green accent
+            self.message_label.setStyleSheet("color: #2c3e50; background: transparent;")
             return (
-                "QFrame { background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #2d3748, stop:1 #4a5568);"
-                "border-radius: 14px; border: 1px solid rgba(255,255,255,0.04);}"
+                "QFrame { background: rgba(255,255,255,0.95);"
+                "border-left: 3px solid #00ff88; border-radius: 16px; }"
             )
 
     def append_text(self, text: str):
         """Append text for streaming messages"""
         self.message += text
         self.message_label.setText(self.message)
+        
+    # for highlighting:
+    def highlight_sentence(self, sentence: str):
+        """Highlights a specific sentence within the bubble's text."""
+        if not self.message or not sentence:
+            return
+
+         # Sanitize the sentence to avoid issues if it contains HTML-like characters
+        escaped_sentence = html.escape(sentence)
+        escaped_full_message = html.escape(self.message)
+
+        # Create the highlighted version of the sentence
+        highlight_style = "background-color: rgba(102, 126, 234, 0.5); border-radius: 4px;"
+        highlighted_sentence_html = f"<span style='{highlight_style}'>{escaped_sentence}</span>"
+        
+        # Replace the plain sentence with the highlighted version in the full text
+        # We work from the original self.message to prevent nested HTML tags
+        final_html = escaped_full_message.replace(escaped_sentence, highlighted_sentence_html, 1)
+        
+        self.message_label.setText(final_html)
+
+    # to clear highlights:
+    def clear_highlight(self):
+        """Removes all highlighting by setting the text to its plain version."""
+        self.message_label.setText(self.message)    
 
     def animate_in(self):
         """Animate bubble appearance"""
@@ -528,6 +637,8 @@ class ChatArea(QScrollArea):
             QTimer.singleShot(10, self.scroll_to_bottom)
 
     def finish_ai_message(self):
+        if self.current_ai_bubble:
+            self.current_ai_bubble.clear_highlight()
         self.current_ai_bubble = None
         QTimer.singleShot(40, self.scroll_to_bottom)
 
@@ -546,7 +657,7 @@ class StatusBar(QFrame):
         layout.setContentsMargins(14, 6, 14, 6)
 
         self.status_dot = QLabel("●")
-        self.status_dot.setStyleSheet("color: #ff6b6b; font-size: 12px;")
+        self.status_dot.setStyleSheet("color: orange; font-size: 12px;")
         self.status_label = QLabel("Connecting...")
         self.status_label.setStyleSheet("color: rgba(255,255,255,0.75);")
 
@@ -556,7 +667,7 @@ class StatusBar(QFrame):
 
     def set_status(self, status: str, connected: bool = False):
         self.status_label.setText(status)
-        color = '#51cf66' if connected else '#ff6b6b'
+        color = '#00ff88' if connected else 'orange'
         self.status_dot.setStyleSheet(f"color: {color}; font-size: 12px;")
 
 
@@ -565,7 +676,7 @@ class ModernInput(QFrame):
         super().__init__()
         self.setFixedHeight(92)
         self.setStyleSheet(
-            "background: rgba(255,255,255,0.02); border-radius: 14px; padding: 12px;"
+            "background: rgba(0,0,0,0.5); border-radius: 25px; padding: 12px;"
         )
         layout = QHBoxLayout(self)
         layout.setContentsMargins(12, 8, 12, 8)
@@ -577,8 +688,8 @@ class ModernInput(QFrame):
         tf.setPointSize(13)
         self.text_input.setFont(tf)
         self.text_input.setStyleSheet(
-            "QLineEdit { background: rgba(255,255,255,0.01); border: 1px solid rgba(255,255,255,0.03);"
-            "border-radius: 18px; padding: 12px; color: white;} QLineEdit:focus { border-color: #667eea; }"
+            "QLineEdit { background: transparent; border: none;"
+            "border-radius: 18px; padding: 12px; color: white;}"
         )
 
         self.send_button = ModernButton("Send", "→", primary=True)
@@ -608,7 +719,7 @@ class ModernChatGUI(QMainWindow):
         self.setup_worker()
 
     def setup_ui(self):
-        self.setWindowTitle("Modern Chat Bot")
+        self.setWindowTitle("Neuro-sama AI VTuber")
         self.setMinimumSize(920, 680)
         self.resize(1024, 780)
 
@@ -619,20 +730,32 @@ class ModernChatGUI(QMainWindow):
         main_layout.setContentsMargins(12, 12, 12, 12)
         main_layout.setSpacing(8)
 
+        # Background to match web gradient
+        self.setStyleSheet(
+            """
+            QMainWindow { 
+                background: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:1,
+                    stop:0 #1e3c72, stop:0.25 #2a5298, stop:0.75 #764ba2, stop:1 #e91e63
+                );
+            }
+            """
+        )
+
         # Header
         header = QFrame()
         header.setFixedHeight(72)
         header.setStyleSheet(
-            "background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #0f1724, stop:1 #1b1f2b); border-radius:10px;"
+            "background: rgba(0,0,0,0.6); border-radius:12px;"
         )
         hl = QHBoxLayout(header)
         hl.setContentsMargins(16, 8, 16, 8)
-        title = QLabel("Modern Chat Bot")
+        title = QLabel("Neuro-sama AI VTuber")
         tfont = QFont()
         tfont.setPointSize(18)
         tfont.setBold(True)
         title.setFont(tfont)
-        title.setStyleSheet("color: white;")
+        title.setStyleSheet("color: #00ff88;")
         hl.addWidget(title)
         hl.addStretch()
 
@@ -651,6 +774,8 @@ class ModernChatGUI(QMainWindow):
         main_layout.addWidget(self.status_bar)
 
         self.chat_area.add_system_message("Welcome — Modern Chat Bot ready")
+        # Match web system style tone
+        self.chat_area.add_system_message("I'm an AI VTuber with no filter - expect chaos and sass! 😈")
 
     def setup_connections(self):
         self.input_area.send_button.clicked.connect(self.send_message)
@@ -662,6 +787,7 @@ class ModernChatGUI(QMainWindow):
         self.worker = ConnectionWorker(WS_URL)
         self.worker.message_received.connect(self.on_message_received)
         self.worker.connection_changed.connect(self.on_connection_changed)
+        self.worker.tts_sync_received.connect(self.on_tts_sync)
         self.worker.start()
         self.status_bar.set_status("Connecting...", False)
 
@@ -689,12 +815,21 @@ class ModernChatGUI(QMainWindow):
             self.chat_area.finish_ai_message()
             self.input_area.send_button.setEnabled(True)
             self._current_message_started = False
+            
+    def on_tts_sync(self, sentence: str):
+        """Handles the TTS sync signal from the worker."""
+        # The chat_area's current_ai_bubble is the one being streamed
+        if self.chat_area.current_ai_bubble:
+            self.chat_area.current_ai_bubble.highlight_sentence(sentence)
+
 
     def on_connection_changed(self, connected: bool, status: str):
         self.status_bar.set_status(status, connected)
         if connected:
             self.chat_area.add_system_message("Connected to chat bot")
         else:
+            if self.chat_area.current_ai_bubble:
+                self.chat_area.current_ai_bubble.clear_highlight()
             self.chat_area.add_system_message(f"Connection issue: {status}")
             # Reset message state on disconnection
             self._current_message_started = False
