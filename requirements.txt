@@ -1,0 +1,12 @@
+ollama
+fastapi
+uvicorn
+websockets
+requests
+PyQt6
+torch
+simpleaudio
+TTS
+numpy
+trimesh
+PyOpenGL
