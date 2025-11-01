@@ -68,7 +68,6 @@ This is a GPU-accelerated 3D model viewer that serves as a clone of VTube Studio
     ```bash
     pip install -r requirements.txt
     ```
-    *Note: You may need to install some dependencies manually, such as PyAudio and PyOpenGL.*
 
 ### Usage
 
