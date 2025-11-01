@@ -60,7 +60,7 @@ This is a GPU-accelerated 3D model viewer that serves as a clone of VTube Studio
 
 1.  **Clone the repository:**
     ```bash
-    git clone https://github.com/your-username/ai-vtuber-waifu.git
+    git clone https://github.com/ThatRandomGuyYT/ai-vtuber-waifu.git
     cd ai-vtuber-waifu
     ```
 
